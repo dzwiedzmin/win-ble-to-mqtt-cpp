@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <mutex>
 #include <sstream> 
 #include <iomanip>
@@ -40,6 +41,15 @@ using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
 std::mutex mqtt_mutex;
 std::mutex device_mutex;
 mosqpp::mosquittopp *mqtt = nullptr;
+
+const int REPORT_INTERVAL = 50;
+
+typedef struct
+{
+	double temp = 0;
+	double humid = 0;
+	double count = 0;
+} stats_t;
 
 std::unordered_set<unsigned long long> devices;
 
@@ -59,7 +69,7 @@ public:
 };
 
 
-void SendMQTT(std::string topic, std::string value)
+void SendMQTT(std::string topic, std::string value, bool retain)
 {
 	//c:\Program Files\mosquitto\mosquitto_pub.exe -t "sensors/BLE/582d343a840a/temp" -h localhost -m "12.3"
 	//std::string cmd = "cmd /S /C \"\"c:\\Program Files\\mosquitto\\mosquitto_pub.exe\" -t \"" + topic + "\" -h localhost -m \"" + value + "\"\" > nul";
@@ -69,7 +79,7 @@ void SendMQTT(std::string topic, std::string value)
 	const char *buf = value.c_str();
 
 	mqtt_mutex.lock();
-	res = mqtt->publish(NULL, topic.c_str(), (int)strlen(buf), buf);
+	res = mqtt->publish(NULL, topic.c_str(), (int)strlen(buf), buf, 0, retain);
 	if ( res != 0)
 	{
 		std::cout << std::string("mqtt_send error=" + std::to_string(res) + "\n");
@@ -338,7 +348,7 @@ concurrency::task<void> batteryCheck(Bluetooth::BluetoothLEDevice ^leDevice) {
 				auto data = getData(cval->Value);
 				std::cout << "BATTERY[" + mac + "]" << (int)data.front() << std::endl;
 
-				SendMQTT("sensors/BLE/" + mac + "/batt", std::to_string(data.front()));
+				SendMQTT("sensors/BLE/" + mac + "/batt", std::to_string(data.front()), true);
 				return;
 			}
 
@@ -364,6 +374,8 @@ concurrency::task<void> connectToXiaomiTempSensor(unsigned long long bluetoothAd
 	
 	auto serviceUUID = StringToGUID("{226c0000-6476-4566-7562-66734470666d}");
 	auto characteristicUUID = StringToGUID("{226caa55-6476-4566-7562-66734470666d}");
+
+	stats_t stats;
 
 	while (1)
 	{
@@ -401,7 +413,7 @@ concurrency::task<void> connectToXiaomiTempSensor(unsigned long long bluetoothAd
 
 
 			characteristic->ValueChanged += ref new Windows::Foundation::TypedEventHandler<GattCharacteristic ^, GattValueChangedEventArgs ^>(
-				[mac](GattCharacteristic ^sender, GattValueChangedEventArgs^ args) {
+				[mac, &stats](GattCharacteristic ^sender, GattValueChangedEventArgs^ args) {
 
 				auto data = getData(args->CharacteristicValue);
 				std::string s(data.begin(), data.end());
@@ -412,8 +424,24 @@ concurrency::task<void> connectToXiaomiTempSensor(unsigned long long bluetoothAd
 				std::regex reg("T=(.*) H=(.*)");
 				if (std::regex_match(s, m, reg))
 				{
-					SendMQTT("sensors/BLE/" + mac + "/temp", m[1].str());
-					SendMQTT("sensors/BLE/" + mac + "/humid", m[2].str());
+					char* end;
+					stats.count += 1.0;
+					stats.temp += strtod(m[1].str().c_str(), &end);
+					stats.humid += strtod(m[2].str().c_str(), &end);
+
+					if (stats.count >= REPORT_INTERVAL)
+					{
+						std::string temp  = std::to_string(stats.temp / stats.count);
+						std::string humid = std::to_string(stats.humid / stats.count);
+
+						SendMQTT("sensors/BLE/" + mac + "/temp", temp, false);
+						SendMQTT("sensors/BLE/" + mac + "/humid", humid, false);
+
+						stats.count = 0;
+						stats.temp  = 0;
+						stats.humid = 0;
+					}
+
 					//std::cout << m.size() << std::endl;
 				}
 			});
@@ -462,7 +490,7 @@ int main(Array<String^>^ args) {
 	//add known devises [the INT= one] here for faster startup
 	connectToXiaomiTempSensor(96951173022730);
 	connectToXiaomiTempSensor(96951173020050);
-
+	/**/
 	Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher^ bleWatch = ref new Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher();
 	bleWatch->Received += ref new Windows::Foundation::TypedEventHandler<Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher ^, Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementReceivedEventArgs ^>(
 		[](Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher ^watcher, Bluetooth::Advertisement::BluetoothLEAdvertisementReceivedEventArgs^ eventArgs) {
@@ -504,6 +532,7 @@ int main(Array<String^>^ args) {
 	});
 	bleWatch->ScanningMode = Bluetooth::Advertisement::BluetoothLEScanningMode::Active;
 	bleWatch->Start();
+	/**/
 	getchar();
 
 	
